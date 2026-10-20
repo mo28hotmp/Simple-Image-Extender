@@ -83,10 +83,12 @@ def parse_percent(text):
 
 
 def parse_color(text):
-    """Return an (r, g, b, a) tuple or None."""
+    """Return an (r, g, b, a) tuple, "dominant"/"edge", or None."""
     t = text.strip().lower()
     if t in ("transparent", "none", "clear"):
         return (0, 0, 0, 0)
+    if t in ("dominant", "edge", "edges"):
+        return "edge" if t.startswith("edge") else t
     if t and len(t) in (3, 4, 6, 8) and all(c in "0123456789abcdef" for c in t):
         t = "#" + t
     try:
@@ -96,12 +98,47 @@ def parse_color(text):
     return c if len(c) == 4 else (*c, 255)
 
 
+def dominant_color(img):
+    """Most common color of the picture (after reducing it to 8 colors)."""
+    small = img.convert("RGB")
+    small.thumbnail((128, 128))
+    q = small.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
+    _, index = max(q.getcolors())
+    palette = q.getpalette()
+    return (*palette[index * 3 : index * 3 + 3], 255)
+
+
+def edge_color(img, selected):
+    """Average color of the border strips on the sides being extended."""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    tx, ty = max(1, round(w * 0.02)), max(1, round(h * 0.02))
+    strips = {
+        "top": (0, 0, w, ty),
+        "bottom": (0, h - ty, w, h),
+        "left": (0, 0, tx, h),
+        "right": (w - tx, 0, w, h),
+    }
+    samples = [
+        rgb.crop(box).resize((1, 1), Image.BOX).getpixel((0, 0))
+        for side, box in strips.items()
+        if side in selected
+    ]
+    avg = tuple(round(sum(c[i] for c in samples) / len(samples)) for i in range(3))
+    return (*avg, 255)
+
+
 def extend_image(data, selected, percent, color):
-    """Blocking work: returns (bytes, extension, (width, height))."""
+    """Blocking work: returns (bytes, extension, (width, height), color)."""
     with Image.open(io.BytesIO(data)) as im:
         src_format = im.format
         im.load()  # first frame only for animated files
         img = ImageOps.exif_transpose(im)
+
+    if color == "dominant":
+        color = dominant_color(img)
+    elif color == "edge":
+        color = edge_color(img, selected)
 
     has_alpha = "A" in img.getbands() or "transparency" in img.info
     if img.mode not in ("RGB", "RGBA"):
@@ -131,7 +168,7 @@ def extend_image(data, selected, percent, color):
             ext = "jpg"
     if out.tell() > TG_UPLOAD_LIMIT:
         raise ValueError("result too large")
-    return out.getvalue(), ext, new_size
+    return out.getvalue(), ext, new_size, color
 
 
 def directions_keyboard(selected):
@@ -162,6 +199,12 @@ def color_keyboard():
             [
                 InlineKeyboardButton("🔘 Gray", callback_data="col:gray"),
                 InlineKeyboardButton("🔲 Transparent", callback_data="col:transparent"),
+            ],
+            [
+                InlineKeyboardButton("🎨 From picture: dominant", callback_data="col:dominant"),
+            ],
+            [
+                InlineKeyboardButton("🖼 From picture: edges", callback_data="col:edge"),
             ],
         ]
     )
@@ -264,7 +307,9 @@ async def receive_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud["percent"] = percent
     await update.message.reply_text(
         "Now pick the fill color, or type one:\n"
-        "a name (red, navy), a hex code (#ff8800) or rgb(255, 136, 0).",
+        "a name (red, navy), a hex code (#ff8800) or rgb(255, 136, 0).\n\n"
+        "Or take it from the picture: \"dominant\" is its most common color, "
+        "\"edges\" averages the borders you're extending.",
         reply_markup=color_keyboard(),
     )
     return COLOR
@@ -284,7 +329,8 @@ async def color_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     color = parse_color(update.message.text)
     if color is None:
         await update.message.reply_text(
-            "I don't know that color. Try a name like red, or a hex code like #ff8800."
+            "I don't know that color. Try a name like red, a hex code like #ff8800, "
+            "or \"dominant\" / \"edge\"."
         )
         return COLOR
     return await run_extend(update, context, color)
@@ -298,13 +344,19 @@ async def run_extend(update: Update, context: ContextTypes.DEFAULT_TYPE, color):
 
     try:
         async with PROCESS_SLOTS:
-            result, ext, new_size = await asyncio.to_thread(
+            result, ext, new_size, used = await asyncio.to_thread(
                 extend_image, ud["image"], ud["selected"], ud["percent"], color
             )
+        fill_label = (
+            "transparent"
+            if used[3] == 0
+            else "#{:02x}{:02x}{:02x}".format(*used[:3])
+        )
         await chat.send_document(
             document=InputFile(io.BytesIO(result), filename=f"extended.{ext}"),
             caption=(
                 f"Done! {old_size[0]}×{old_size[1]} → {new_size[0]}×{new_size[1]} px\n"
+                f"Fill: {fill_label}\n"
                 "Send another image to start again."
             ),
         )
