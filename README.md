@@ -7,7 +7,7 @@ A Telegram bot that extends an image by adding blank space around it. No AI gene
 1. Send the bot an image, as a photo or as a file. Any format Pillow can open works (JPEG, PNG, WebP, BMP, TIFF, HEIC and more). Animated files use their first frame.
 2. Pick one or more directions: top, bottom, left, right.
 3. Send a percentage, for example `20` or `12.5`. Left and right use the image width, top and bottom use the height.
-4. Pick a fill color with a button, or type a color name, a hex code (`#ff8800`) or `rgb(255, 136, 0)`. Choose "Transparent" for a transparent border (output is PNG).
+4. Pick a fill color with a button, or type a color name, a hex code (`#ff8800`) or `rgb(255, 136, 0)`. Choose "Transparent" for a transparent border (output is PNG). You can also take the color from the picture itself: `dominant` uses its most common color, and `edge` averages the borders on the sides being extended.
 5. The bot sends back the extended image as a file, so Telegram doesn't compress it.
 
 Commands: `/start`, `/help`, `/cancel`.
