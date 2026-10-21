@@ -45,7 +45,7 @@ MAX_PERCENT = 500
 TG_UPLOAD_LIMIT = 49 * 1024 * 1024  # bots can upload up to 50 MB
 PROCESS_SLOTS = asyncio.Semaphore(2)
 
-DIRECTIONS, PERCENT, COLOR, PICK = range(4)
+DIRECTIONS, PERCENT, COLOR, PICK, SAMPLE = range(5)
 GRID_COLS, GRID_ROWS = 5, 5
 GRID_LETTERS = "ABCDEFGH"
 ORDER = ["top", "bottom", "left", "right"]
@@ -179,6 +179,25 @@ def grid_preview(data):
     return out.getvalue()
 
 
+def average_color(data):
+    """Average color of a whole (sample) image; transparent pixels are ignored."""
+    img, _ = load_oriented(data)
+    if "A" in img.getbands() or "transparency" in img.info:
+        small = img.convert("RGBA")
+        small.thumbnail((64, 64), Image.BOX)
+        total = r = g = b = 0
+        for pr, pg, pb, pa in small.getdata():
+            total += pa
+            r += pr * pa
+            g += pg * pa
+            b += pb * pa
+        if total == 0:
+            raise ValueError("fully transparent")
+        return (round(r / total), round(g / total), round(b / total), 255)
+    px = img.convert("RGB").resize((1, 1), Image.BOX).getpixel((0, 0))
+    return (*px, 255)
+
+
 def dominant_color(img):
     """Most common color of the picture (after reducing it to 8 colors)."""
     small = img.convert("RGB")
@@ -300,6 +319,11 @@ def color_keyboard():
                 )
             ],
             [
+                InlineKeyboardButton(
+                    "📎 Send a part of the picture", callback_data="col:sample"
+                )
+            ],
+            [
                 InlineKeyboardButton("🎨 Dominant", callback_data="col:dominant"),
                 InlineKeyboardButton("🖼 Edges", callback_data="col:edge"),
             ],
@@ -312,14 +336,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME)
 
 
-async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+async def download_attachment(msg):
     item = msg.photo[-1] if msg.photo else msg.document
+    tg_file = await item.get_file()
+    return bytes(await tg_file.download_as_bytearray())
+
+
+async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # While the bot waits for a sample image, a new image is that sample.
+    if context.user_data.get("awaiting_sample"):
+        return await receive_sample(update, context)
+
+    msg = update.message
     await msg.chat.send_action(ChatAction.TYPING)
 
     try:
-        tg_file = await item.get_file()
-        data = bytes(await tg_file.download_as_bytearray())
+        data = await download_attachment(msg)
     except BadRequest:
         await msg.reply_text(
             "I can't download that file - Telegram only lets bots read files up to 20 MB."
@@ -327,8 +359,7 @@ async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        with Image.open(io.BytesIO(data)) as im:
-            size = im.size
+        size = await asyncio.to_thread(lambda: load_oriented(data)[0].size)
     except Exception:
         await msg.reply_text(
             "I couldn't read that as an image (or it's too large). "
@@ -386,8 +417,9 @@ async def ask_color(chat):
     await chat.send_message(
         "Now pick the fill color, or type one:\n"
         "a name (red, navy), a hex code (#ff8800) or rgb(255, 136, 0).\n\n"
-        "Or take it from the picture: 📍 pick any spot on it, use its "
-        "dominant color, or the average of the edges you're extending.",
+        "Or take it from the picture: 📍 pick a spot on a grid, 📎 send me a "
+        "small part of it to average, use its dominant color, or the average "
+        "of the edges you're extending.",
         reply_markup=color_keyboard(),
     )
 
@@ -426,6 +458,8 @@ async def color_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = q.data.split(":", 1)[1]
     if choice == "pick":
         return await show_picker(update, context)
+    if choice == "sample":
+        return await ask_sample(update, context)
     return await run_extend(update, context, parse_color(choice))
 
 
@@ -444,6 +478,58 @@ async def show_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=pick_keyboard(),
     )
     return PICK
+
+
+async def ask_sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_sample"] = True
+    await update.effective_chat.send_message(
+        "Send me an image of just the part whose color you want, for example a "
+        "small crop of the sky. I'll average all its colors and use that as the "
+        "fill.\n\nTip: send it as a file to avoid compression.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="sample:back")]]
+        ),
+    )
+    return SAMPLE
+
+
+async def sample_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data.pop("awaiting_sample", None)
+    try:
+        await q.edit_message_reply_markup(None)
+    except BadRequest:
+        pass
+    await ask_color(update.effective_chat)
+    return COLOR
+
+
+async def sample_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Please send an image, or tap Back above.")
+    return SAMPLE
+
+
+async def receive_sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    await msg.chat.send_action(ChatAction.TYPING)
+    try:
+        data = await download_attachment(msg)
+    except BadRequest:
+        await msg.reply_text(
+            "I can't download that file - Telegram only lets bots read files up to 20 MB."
+        )
+        return SAMPLE
+    try:
+        async with PROCESS_SLOTS:
+            color = await asyncio.to_thread(average_color, data)
+    except Exception:
+        await msg.reply_text(
+            "I couldn't read a color from that. Send another image, or tap Back."
+        )
+        return SAMPLE
+    context.user_data.pop("awaiting_sample", None)
+    return await run_extend(update, context, color)
 
 
 async def pick_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -568,6 +654,11 @@ def main():
             PICK: [
                 CallbackQueryHandler(pick_button, pattern=r"^pick:"),
                 MessageHandler(text_filter, pick_text),
+            ],
+            SAMPLE: [
+                CallbackQueryHandler(sample_back, pattern=r"^sample:"),
+                MessageHandler(image_filter, receive_sample),
+                MessageHandler(text_filter, sample_hint),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
