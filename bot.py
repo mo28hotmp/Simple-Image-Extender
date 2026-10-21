@@ -5,6 +5,7 @@ returns the image extended with that colour (no generation, just fill).
 """
 
 import asyncio
+import functools
 import hashlib
 import io
 import logging
@@ -45,9 +46,20 @@ MAX_PERCENT = 500
 TG_UPLOAD_LIMIT = 49 * 1024 * 1024  # bots can upload up to 50 MB
 PROCESS_SLOTS = asyncio.Semaphore(2)
 
-DIRECTIONS, PERCENT, COLOR, PICK, SAMPLE = range(5)
+DIRECTIONS, PERCENT, COLOR, PICK, SAMPLE, PALETTE = range(6)
 GRID_COLS, GRID_ROWS = 5, 5
 GRID_LETTERS = "ABCDEFGH"
+PALETTE_COLORS = [
+    ("Red", "#e53935"), ("Orange", "#fb8c00"), ("Yellow", "#fdd835"),
+    ("Lime", "#c0ca33"), ("Green", "#43a047"), ("Teal", "#00897b"),
+    ("Cyan", "#00acc1"), ("Sky", "#29b6f6"), ("Blue", "#1e88e5"),
+    ("Navy", "#1a237e"), ("Purple", "#8e24aa"), ("Pink", "#ec407a"),
+    ("Maroon", "#7b1f1f"), ("Brown", "#6d4c41"), ("Beige", "#d7c4a3"),
+    ("Cream", "#fff8e1"), ("Mint", "#a5d6a7"), ("Lavender", "#b39ddb"),
+    ("Peach", "#ffcc80"), ("Salmon", "#ff8a80"), ("White", "#ffffff"),
+    ("Light gray", "#d9d9d9"), ("Gray", "#808080"), ("Black", "#000000"),
+]
+PALETTE_COLS = 6
 ORDER = ["top", "bottom", "left", "right"]
 LABELS = {
     "top": "⬆️ Top",
@@ -198,6 +210,33 @@ def average_color(data):
     return (*px, 255)
 
 
+@functools.lru_cache(maxsize=1)
+def palette_image():
+    """PNG of the numbered color palette (built once, then cached)."""
+    cols = PALETTE_COLS
+    rows = -(-len(PALETTE_COLORS) // cols)
+    cw, ch, gap = 150, 110, 4
+    img = Image.new("RGB", (cols * cw, rows * ch), (235, 235, 235))
+    draw = ImageDraw.Draw(img)
+    big = ImageFont.load_default(size=40)
+    small = ImageFont.load_default(size=18)
+    for i, (name, hex_code) in enumerate(PALETTE_COLORS):
+        r, c = divmod(i, cols)
+        x0, y0 = c * cw, r * ch
+        rgb = ImageColor.getrgb(hex_code)
+        draw.rectangle(
+            (x0 + gap, y0 + gap, x0 + cw - gap - 1, y0 + ch - gap - 1), fill=rgb
+        )
+        luma = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+        ink = "black" if luma > 150 else "white"
+        cx, cy = x0 + cw / 2, y0 + ch / 2
+        draw.text((cx, cy - 12), str(i + 1), font=big, fill=ink, anchor="mm")
+        draw.text((cx, cy + 26), name, font=small, fill=ink, anchor="mm")
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return out.getvalue()
+
+
 def dominant_color(img):
     """Most common color of the picture (after reducing it to 8 colors)."""
     small = img.convert("RGB")
@@ -288,6 +327,19 @@ def directions_keyboard(selected):
     )
 
 
+def palette_keyboard():
+    n = len(PALETTE_COLORS)
+    rows = [
+        [
+            InlineKeyboardButton(str(i + 1), callback_data=f"pal:{i}")
+            for i in range(start, min(start + PALETTE_COLS, n))
+        ]
+        for start in range(0, n, PALETTE_COLS)
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="pal:back")])
+    return InlineKeyboardMarkup(rows)
+
+
 def pick_keyboard():
     rows = [
         [
@@ -313,6 +365,7 @@ def color_keyboard():
                 InlineKeyboardButton("🔘 Gray", callback_data="col:gray"),
                 InlineKeyboardButton("🔲 Transparent", callback_data="col:transparent"),
             ],
+            [InlineKeyboardButton("🌈 Color palette", callback_data="col:palette")],
             [
                 InlineKeyboardButton(
                     "📍 Pick a spot on the picture", callback_data="col:pick"
@@ -342,13 +395,37 @@ async def download_attachment(msg):
     return bytes(await tg_file.download_as_bytearray())
 
 
+def begin_with_image(context, data, size):
+    context.user_data.clear()
+    context.user_data.update(image=data, size=size, selected=set())
+
+
+async def ask_directions(chat, size):
+    await chat.send_message(
+        f"Got it ({size[0]}×{size[1]} px). Which directions should I extend?\n"
+        "Tap to toggle, then press Done.",
+        reply_markup=directions_keyboard(set()),
+    )
+
+
 async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ud = context.user_data
+    msg = update.message
+    chat = update.effective_chat
+    # Mid-flow = a base image is stored and we're at (or past) the color step.
+    midflow = ud.get("image") is not None and ud.get("percent") is not None
+    log.info(
+        "image received: midflow=%s awaiting_sample=%s",
+        midflow,
+        bool(ud.get("awaiting_sample")),
+    )
+
     # While the bot waits for a sample image, a new image is that sample.
-    if context.user_data.get("awaiting_sample"):
+    if ud.get("awaiting_sample"):
         return await receive_sample(update, context)
 
-    msg = update.message
-    await msg.chat.send_action(ChatAction.TYPING)
+    stay = None if midflow else ConversationHandler.END  # None keeps the state
+    await chat.send_action(ChatAction.TYPING)
 
     try:
         data = await download_attachment(msg)
@@ -356,7 +433,7 @@ async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(
             "I can't download that file - Telegram only lets bots read files up to 20 MB."
         )
-        return ConversationHandler.END
+        return stay
 
     try:
         size = await asyncio.to_thread(lambda: load_oriented(data)[0].size)
@@ -365,16 +442,66 @@ async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "I couldn't read that as an image (or it's too large). "
             "Try another file."
         )
-        return ConversationHandler.END
+        return stay
 
-    context.user_data.clear()
-    context.user_data.update(image=data, size=size, selected=set())
-    await msg.reply_text(
-        f"Got it ({size[0]}×{size[1]} px). Which directions should I extend?\n"
-        "Tap to toggle, then press Done.",
-        reply_markup=directions_keyboard(set()),
-    )
+    if midflow:
+        # Could be a color sample or a brand-new image: ask instead of guessing.
+        ud["pending"] = (data, size)
+        await msg.reply_text(
+            "I'm in the middle of extending your first image. What should I do "
+            "with this one?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🎨 Use it as the color sample", callback_data="pend:sample"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🆕 Start over with it", callback_data="pend:new"
+                        )
+                    ],
+                ]
+            ),
+        )
+        return stay
+
+    begin_with_image(context, data, size)
+    await ask_directions(chat, size)
     return DIRECTIONS
+
+
+async def pending_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        await q.edit_message_reply_markup(None)
+    except BadRequest:
+        pass
+    chat = update.effective_chat
+    pending = context.user_data.pop("pending", None)
+    if pending is None:
+        await chat.send_message("I no longer have that image. Please send it again.")
+        return None
+    data, size = pending
+
+    if q.data.endswith(":new"):
+        begin_with_image(context, data, size)
+        await ask_directions(chat, size)
+        return DIRECTIONS
+
+    try:
+        async with PROCESS_SLOTS:
+            color = await asyncio.to_thread(average_color, data)
+    except Exception:
+        await chat.send_message(
+            "I couldn't read a color from that image. Send another one or pick "
+            "a color above."
+        )
+        return None
+    context.user_data.pop("awaiting_sample", None)
+    return await run_extend(update, context, color)
 
 
 async def choose_direction(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,6 +544,7 @@ async def ask_color(chat):
     await chat.send_message(
         "Now pick the fill color, or type one:\n"
         "a name (red, navy), a hex code (#ff8800) or rgb(255, 136, 0).\n\n"
+        "Or choose from a 🌈 palette of 24 colors.\n\n"
         "Or take it from the picture: 📍 pick a spot on a grid, 📎 send me a "
         "small part of it to average, use its dominant color, or the average "
         "of the edges you're extending.",
@@ -456,6 +584,8 @@ async def color_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except BadRequest:
         pass
     choice = q.data.split(":", 1)[1]
+    if choice == "palette":
+        return await show_palette(update, context)
     if choice == "pick":
         return await show_picker(update, context)
     if choice == "sample":
@@ -478,6 +608,33 @@ async def show_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=pick_keyboard(),
     )
     return PICK
+
+
+async def show_palette(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await chat.send_action(ChatAction.UPLOAD_PHOTO)
+    png = await asyncio.to_thread(palette_image)
+    await chat.send_photo(
+        photo=InputFile(io.BytesIO(png), filename="palette.png"),
+        caption="Tap the number of the color you want.",
+        reply_markup=palette_keyboard(),
+    )
+    return PALETTE
+
+
+async def palette_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        await q.edit_message_reply_markup(None)
+    except BadRequest:
+        pass
+    arg = q.data.split(":", 1)[1]
+    if arg == "back":
+        await ask_color(update.effective_chat)
+        return COLOR
+    _, hex_code = PALETTE_COLORS[int(arg)]
+    return await run_extend(update, context, (*ImageColor.getrgb(hex_code), 255))
 
 
 async def ask_sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -655,13 +812,19 @@ def main():
                 CallbackQueryHandler(pick_button, pattern=r"^pick:"),
                 MessageHandler(text_filter, pick_text),
             ],
+            PALETTE: [
+                CallbackQueryHandler(palette_button, pattern=r"^pal:"),
+            ],
             SAMPLE: [
                 CallbackQueryHandler(sample_back, pattern=r"^sample:"),
                 MessageHandler(image_filter, receive_sample),
                 MessageHandler(text_filter, sample_hint),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(pending_choice, pattern=r"^pend:"),
+        ],
         allow_reentry=True,
     )
 
