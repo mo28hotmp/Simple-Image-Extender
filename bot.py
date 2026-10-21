@@ -10,7 +10,7 @@ import io
 import logging
 import os
 
-from PIL import Image, ImageColor, ImageOps
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
 from pillow_heif import register_heif_opener
 from telegram import (
     InlineKeyboardButton,
@@ -45,7 +45,9 @@ MAX_PERCENT = 500
 TG_UPLOAD_LIMIT = 49 * 1024 * 1024  # bots can upload up to 50 MB
 PROCESS_SLOTS = asyncio.Semaphore(2)
 
-DIRECTIONS, PERCENT, COLOR = range(3)
+DIRECTIONS, PERCENT, COLOR, PICK = range(4)
+GRID_COLS, GRID_ROWS = 5, 5
+GRID_LETTERS = "ABCDEFGH"
 ORDER = ["top", "bottom", "left", "right"]
 LABELS = {
     "top": "⬆️ Top",
@@ -98,6 +100,85 @@ def parse_color(text):
     return c if len(c) == 4 else (*c, 255)
 
 
+def parse_point(text):
+    """'40 25' or '40, 25' (percent from the top-left) -> ("spot", fx, fy)."""
+    parts = text.replace("%", " ").replace(",", " ").replace(";", " ").split()
+    if len(parts) != 2:
+        return None
+    try:
+        x, y = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= x <= 100 and 0 <= y <= 100):
+        return None
+    return ("spot", x / 100, y / 100)
+
+
+def load_oriented(data):
+    """Open image bytes, apply EXIF rotation. Returns (image, source format)."""
+    with Image.open(io.BytesIO(data)) as im:
+        src_format = im.format
+        im.load()  # first frame only for animated files
+        img = ImageOps.exif_transpose(im)
+    return img, src_format
+
+
+def spot_color(img, fx, fy):
+    """Average color of a tiny area (about 2% of the image) around a point."""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    cx = min(w - 1, max(0, round(fx * (w - 1))))
+    cy = min(h - 1, max(0, round(fy * (h - 1))))
+    r = max(1, round(min(w, h) * 0.01))
+    box = (max(0, cx - r), max(0, cy - r), min(w, cx + r + 1), min(h, cy + r + 1))
+    px = rgb.crop(box).resize((1, 1), Image.BOX).getpixel((0, 0))
+    return (*px, 255)
+
+
+def grid_preview(data):
+    """JPEG of the picture with a labelled grid; dots mark the sampled spots."""
+    img, _ = load_oriented(data)
+    img = img.convert("RGB")
+    img.thumbnail((1000, 1000))
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=max(14, min(w, h) // 20))
+
+    for i in range(1, GRID_COLS):
+        x = round(w * i / GRID_COLS)
+        draw.line([(x, 0), (x, h)], fill="black", width=3)
+        draw.line([(x, 0), (x, h)], fill="white", width=1)
+    for j in range(1, GRID_ROWS):
+        y = round(h * j / GRID_ROWS)
+        draw.line([(0, y), (w, y)], fill="black", width=3)
+        draw.line([(0, y), (w, y)], fill="white", width=1)
+
+    dot = max(4, min(w, h) // 100)
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            x0, y0 = w * c / GRID_COLS, h * r / GRID_ROWS
+            draw.text(
+                (x0 + 6, y0 + 4),
+                f"{GRID_LETTERS[c]}{r + 1}",
+                font=font,
+                fill="white",
+                stroke_width=2,
+                stroke_fill="black",
+            )
+            cx = w * (c + 0.5) / GRID_COLS
+            cy = h * (r + 0.5) / GRID_ROWS
+            draw.ellipse(
+                (cx - dot, cy - dot, cx + dot, cy + dot),
+                fill="white",
+                outline="black",
+                width=2,
+            )
+
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=85)
+    return out.getvalue()
+
+
 def dominant_color(img):
     """Most common color of the picture (after reducing it to 8 colors)."""
     small = img.convert("RGB")
@@ -130,15 +211,14 @@ def edge_color(img, selected):
 
 def extend_image(data, selected, percent, color):
     """Blocking work: returns (bytes, extension, (width, height), color)."""
-    with Image.open(io.BytesIO(data)) as im:
-        src_format = im.format
-        im.load()  # first frame only for animated files
-        img = ImageOps.exif_transpose(im)
+    img, src_format = load_oriented(data)
 
     if color == "dominant":
         color = dominant_color(img)
     elif color == "edge":
         color = edge_color(img, selected)
+    elif color[0] == "spot":
+        color = spot_color(img, color[1], color[2])
 
     has_alpha = "A" in img.getbands() or "transparency" in img.info
     if img.mode not in ("RGB", "RGBA"):
@@ -189,6 +269,20 @@ def directions_keyboard(selected):
     )
 
 
+def pick_keyboard():
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{GRID_LETTERS[c]}{r + 1}", callback_data=f"pick:{c},{r}"
+            )
+            for c in range(GRID_COLS)
+        ]
+        for r in range(GRID_ROWS)
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="pick:back")])
+    return InlineKeyboardMarkup(rows)
+
+
 def color_keyboard():
     return InlineKeyboardMarkup(
         [
@@ -201,10 +295,13 @@ def color_keyboard():
                 InlineKeyboardButton("🔲 Transparent", callback_data="col:transparent"),
             ],
             [
-                InlineKeyboardButton("🎨 From picture: dominant", callback_data="col:dominant"),
+                InlineKeyboardButton(
+                    "📍 Pick a spot on the picture", callback_data="col:pick"
+                )
             ],
             [
-                InlineKeyboardButton("🖼 From picture: edges", callback_data="col:edge"),
+                InlineKeyboardButton("🎨 Dominant", callback_data="col:dominant"),
+                InlineKeyboardButton("🖼 Edges", callback_data="col:edge"),
             ],
         ]
     )
@@ -285,6 +382,16 @@ async def directions_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return DIRECTIONS
 
 
+async def ask_color(chat):
+    await chat.send_message(
+        "Now pick the fill color, or type one:\n"
+        "a name (red, navy), a hex code (#ff8800) or rgb(255, 136, 0).\n\n"
+        "Or take it from the picture: 📍 pick any spot on it, use its "
+        "dominant color, or the average of the edges you're extending.",
+        reply_markup=color_keyboard(),
+    )
+
+
 async def receive_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = context.user_data
     percent = parse_percent(update.message.text)
@@ -305,13 +412,7 @@ async def receive_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PERCENT
 
     ud["percent"] = percent
-    await update.message.reply_text(
-        "Now pick the fill color, or type one:\n"
-        "a name (red, navy), a hex code (#ff8800) or rgb(255, 136, 0).\n\n"
-        "Or take it from the picture: \"dominant\" is its most common color, "
-        "\"edges\" averages the borders you're extending.",
-        reply_markup=color_keyboard(),
-    )
+    await ask_color(update.effective_chat)
     return COLOR
 
 
@@ -322,7 +423,54 @@ async def color_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(None)
     except BadRequest:
         pass
-    return await run_extend(update, context, parse_color(q.data.split(":", 1)[1]))
+    choice = q.data.split(":", 1)[1]
+    if choice == "pick":
+        return await show_picker(update, context)
+    return await run_extend(update, context, parse_color(choice))
+
+
+async def show_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await chat.send_action(ChatAction.UPLOAD_PHOTO)
+    async with PROCESS_SLOTS:
+        preview = await asyncio.to_thread(grid_preview, context.user_data["image"])
+    await chat.send_photo(
+        photo=InputFile(io.BytesIO(preview), filename="grid.jpg"),
+        caption=(
+            "Tap a cell to use the color at its dot.\n"
+            "For an exact spot, type its position in % from the top-left, "
+            "like 40 25 (x then y)."
+        ),
+        reply_markup=pick_keyboard(),
+    )
+    return PICK
+
+
+async def pick_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        await q.edit_message_reply_markup(None)
+    except BadRequest:
+        pass
+    arg = q.data.split(":", 1)[1]
+    if arg == "back":
+        await ask_color(update.effective_chat)
+        return COLOR
+    c, r = (int(v) for v in arg.split(","))
+    spot = ("spot", (c + 0.5) / GRID_COLS, (r + 0.5) / GRID_ROWS)
+    return await run_extend(update, context, spot)
+
+
+async def pick_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    spot = parse_point(update.message.text)
+    if spot is None:
+        await update.message.reply_text(
+            "Send two numbers from 0 to 100, like 40 25 (x then y, in % from the "
+            "top-left), or tap a cell above."
+        )
+        return PICK
+    return await run_extend(update, context, spot)
 
 
 async def color_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -330,7 +478,7 @@ async def color_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if color is None:
         await update.message.reply_text(
             "I don't know that color. Try a name like red, a hex code like #ff8800, "
-            "or \"dominant\" / \"edge\"."
+            "or \"dominant\" / \"edges\"."
         )
         return COLOR
     return await run_extend(update, context, color)
@@ -416,6 +564,10 @@ def main():
             COLOR: [
                 CallbackQueryHandler(color_button, pattern=r"^col:"),
                 MessageHandler(text_filter, color_text),
+            ],
+            PICK: [
+                CallbackQueryHandler(pick_button, pattern=r"^pick:"),
+                MessageHandler(text_filter, pick_text),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
